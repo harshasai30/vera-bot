@@ -1,35 +1,25 @@
-"""
-In-memory context store with versioned upsert.
-Scopes: merchant | customer | trigger | session
-"""
+"""Versioned in-memory context + session store."""
 from typing import Any, Dict, Optional
 
 class ContextStore:
     def __init__(self):
-        self._store: Dict[str, Dict[str, Any]] = {}   # scope:id -> {version, payload}
+        self._store: Dict[str, Dict] = {}
         self._sessions: Dict[str, Any] = {}
 
-    def _key(self, scope: str, context_id: str) -> str:
-        return f"{scope}:{context_id}"
+    def _key(self, scope, cid): return f"{scope}:{cid}"
 
-    def upsert(self, scope: str, context_id: str, version: int,
-               payload: Dict[str, Any], delivered_at: str) -> str:
+    def upsert(self, scope, context_id, version, payload, delivered_at):
         k = self._key(scope, context_id)
-        existing = self._store.get(k)
-        if existing and existing["version"] >= version:
+        ex = self._store.get(k)
+        if ex and ex["version"] >= version:
             return "ignored"
-        self._store[k] = {"version": version, "payload": payload,
-                          "delivered_at": delivered_at}
+        self._store[k] = {"version": version, "payload": payload, "delivered_at": delivered_at}
         return "stored"
 
-    def get(self, scope: str, context_id: Optional[str]) -> Optional[Dict[str, Any]]:
-        if not context_id:
-            return None
-        entry = self._store.get(self._key(scope, context_id))
-        return entry["payload"] if entry else None
+    def get(self, scope, context_id) -> Optional[Dict]:
+        if not context_id: return None
+        e = self._store.get(self._key(scope, context_id))
+        return e["payload"] if e else None
 
-    def save_session(self, session_id: str, data: Any):
-        self._sessions[session_id] = data
-
-    def get_session(self, session_id: str) -> Optional[Any]:
-        return self._sessions.get(session_id)
+    def save_session(self, sid, data): self._sessions[sid] = data
+    def get_session(self, sid): return self._sessions.get(sid)

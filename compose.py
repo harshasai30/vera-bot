@@ -1,120 +1,104 @@
 """
-Core compose() function.
-Calls Gemini Pro (or OpenAI as fallback) and returns structured output.
+Core compose() — calls Gemini, returns structured action dict.
+All 6 trigger types, STOP detection, auto-reply loop prevention.
 """
-
-import os, json, logging, re
+import os, json, re, logging
 from typing import Optional, Dict, Any, List
-from prompts import get_category_profile, SYSTEM_PROMPT_TEMPLATE, COMPOSE_USER_TEMPLATE
+from prompts import get_profile, SYSTEM_PROMPT, COMPOSE_USER, TRIGGER_TYPES
 
-logger = logging.getLogger("vera-bot.compose")
+logger = logging.getLogger("vera.compose")
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")   # "gemini" | "openai"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LLM_PROVIDER   = os.getenv("LLM_PROVIDER", "gemini")
+
+# ── STOP / hostile intent detection ─────────────────────────────────────────
+
+STOP_WORDS = {
+    "stop", "no", "nope", "unsubscribe", "cancel", "quit", "exit",
+    "remove", "opt out", "opt-out", "do not contact", "don't contact",
+    "not interested", "leave me alone", "go away", "block"
+}
+
+AUTO_REPLY_MARKERS = [
+    "out of office", "on vacation", "automatic reply", "auto-reply",
+    "autoreply", "i am away", "i'm away", "currently unavailable",
+    "will be back", "on leave"
+]
+
+def is_stop(text: str) -> bool:
+    t = text.lower().strip().strip(".,!?")
+    return t in STOP_WORDS or any(sw in t for sw in STOP_WORDS)
+
+def is_auto_reply(text: str) -> bool:
+    t = text.lower()
+    return any(m in t for m in AUTO_REPLY_MARKERS)
 
 
 # ── LLM callers ──────────────────────────────────────────────────────────────
 
-def _call_gemini(system: str, user: str) -> str:
+def _gemini(system: str, user: str) -> str:
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        system_instruction=system,
-    )
-    resp = model.generate_content(user)
-    return resp.text.strip()
+    model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=system)
+    return model.generate_content(user).text.strip()
 
-
-def _call_openai(system: str, user: str) -> str:
+def _openai(system: str, user: str) -> str:
     from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    resp = client.chat.completions.create(
+    r = OpenAI(api_key=OPENAI_API_KEY).chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        temperature=0.3,
-        max_tokens=500,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        temperature=0.3, max_tokens=500
     )
-    return resp.choices[0].message.content.strip()
+    return r.choices[0].message.content.strip()
 
+def _call(system, user):
+    if LLM_PROVIDER == "openai": return _openai(system, user)
+    return _gemini(system, user)
 
-def _call_llm(system: str, user: str) -> str:
-    if LLM_PROVIDER == "openai":
-        return _call_openai(system, user)
-    return _call_gemini(system, user)
-
-
-# ── JSON extractor ────────────────────────────────────────────────────────────
-
-def _extract_json(raw: str) -> Dict[str, Any]:
-    """Pull JSON from LLM output even if wrapped in markdown fences."""
-    raw = raw.strip()
-    # strip ```json ... ```
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+def _extract_json(raw: str) -> dict:
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
 
 
-# ── Fallback composer (no LLM) ────────────────────────────────────────────────
+# ── Rule-based fallback ──────────────────────────────────────────────────────
 
-def _fallback_compose(merchant: Dict, trigger: Optional[Dict],
-                      customer: Optional[Dict]) -> Dict[str, str]:
-    """
-    Rule-based fallback when LLM is unavailable.
-    Uses trigger type + merchant offer + category to pick the best message.
-    """
-    identity  = merchant.get("identity", {})
-    name      = identity.get("name", "your business")
-    category  = identity.get("category", "restaurant")
-    profile   = get_category_profile(category)
+def _fallback(merchant, trigger, customer) -> dict:
+    identity     = merchant.get("identity", {})
+    name         = identity.get("name", "your business")
+    mid          = identity.get("id", "m_unknown")
+    category     = identity.get("category", "restaurant")
+    profile      = get_profile(category)
+    perf         = merchant.get("performance", {})
+    views        = perf.get("profile_views_today", 0)
+    orders       = perf.get("orders_today", 0)
+    offers       = merchant.get("offers", [])
+    offer        = offers[0] if offers else {}
+    offer_name   = offer.get("name", "special offer")
+    offer_price  = offer.get("price", "")
+    ttype        = (trigger or {}).get("type", "recall")
+    count        = (trigger or {}).get("search_count", 0)
+    intent       = (trigger or {}).get("search_intent", "your services")
+    price_str    = f" at {offer_price}" if offer_price else ""
 
-    perf      = merchant.get("performance", {})
-    views     = perf.get("profile_views_today", 0)
-    orders    = perf.get("orders_today", 0)
-    rating    = perf.get("rating", 0)
+    messages = {
+        "spike":             f"{count} people nearby just searched '{intent}'. Send them your {offer_name}{price_str}?",
+        "dip":               f"Orders are slow today ({orders} so far). Flash {offer_name}{price_str} to boost evening walk-ins?",
+        "recall":            f"{views} people viewed your profile but didn't book. Re-engage them with {offer_name}{price_str}?",
+        "festival":          f"Festive season is here — push a special {offer_name}{price_str} to nearby customers today?",
+        "research":          f"High-intent customers are browsing your category right now. Promote {offer_name}{price_str} to convert them?",
+        "regulation_change": f"New regulations may affect your business. Send customers a reassurance update from {name}?",
+    }
 
-    offers    = merchant.get("offers", [])
-    best_offer = offers[0] if offers else {}
-    offer_name  = best_offer.get("name", "special offer")
-    offer_price = best_offer.get("price", "")
-
-    trigger_type = (trigger or {}).get("type", "recall")
-    trig_count   = (trigger or {}).get("search_count", 0)
-    trig_intent  = (trigger or {}).get("search_intent", "general")
-
-    cust_name = (customer or {}).get("name", "nearby customers")
-
-    # Pick message by trigger type
-    if trigger_type == "spike":
-        msg = (f"{trig_count} people nearby searched '{trig_intent}' in the last hour. "
-               f"Should I send them your {offer_name}"
-               + (f" at {offer_price}" if offer_price else "") + "?")
-    elif trigger_type == "dip":
-        msg = (f"Your {category} orders are {orders} today vs your usual pace. "
-               f"Flash {offer_name} to drive evening walk-ins?")
-    elif trigger_type == "festival":
-        msg = (f"Festive season spike — "
-               f"send a {profile.get('seasonal',['special'])[0]} offer from {name}?")
-    elif trigger_type == "research":
-        msg = (f"High-intent searchers are browsing your category. "
-               f"Promote {offer_name} now to convert them?")
-    else:  # recall
-        msg = (f"{name} had {views} profile views today but low conversions. "
-               f"Want me to push {offer_name} to re-engage them?")
-
-    merchant_id   = identity.get("id", "m_unknown")
-    suppression_k = f"{merchant_id}:{trigger_type}:{__import__('datetime').date.today().strftime('%Y-%m')}"
-
+    body = messages.get(ttype, messages["recall"])
+    from datetime import date
     return {
-        "message": msg[:300],
+        "body": body[:280],
         "cta": profile.get("example_cta", "Reply YES to send now."),
         "send_as": "vera",
-        "suppression_key": suppression_k,
-        "rationale": f"Trigger={trigger_type}, views={views}, orders={orders}, offer={offer_name}"
+        "suppression_key": f"{mid}:{ttype}:{date.today().strftime('%Y-%m')}",
+        "rationale": f"Trigger={ttype}, views={views}, orders={orders}, offer={offer_name}"
     }
 
 
@@ -122,55 +106,43 @@ def _fallback_compose(merchant: Dict, trigger: Optional[Dict],
 
 def compose(
     merchant: Dict[str, Any],
-    trigger: Optional[Dict[str, Any]] = None,
-    customer: Optional[Dict[str, Any]] = None,
+    trigger: Optional[Dict] = None,
+    customer: Optional[Dict] = None,
     reply_history: Optional[List[Dict]] = None,
-) -> Dict[str, str]:
-    """
-    Deterministic compose function.
-    Returns: {message, cta, send_as, suppression_key, rationale}
-    """
+) -> dict:
+    """Returns a validated action dict with body, cta, send_as, suppression_key, rationale."""
 
     identity = merchant.get("identity", {})
     category = identity.get("category", "restaurant")
-    profile  = get_category_profile(category)
+    profile  = get_profile(category)
 
-    system = SYSTEM_PROMPT_TEMPLATE.format(
-        tone=profile.get("tone", ""),
-        voice=profile.get("voice", ""),
-        offer_patterns=", ".join(profile.get("offer_patterns", [])),
-        avoid=", ".join(profile.get("avoid", [])),
-        example_cta=profile.get("example_cta", ""),
-    )
+    # Ensure trigger type is one of the 6 known types
+    if trigger:
+        ttype = trigger.get("type", "recall")
+        if ttype not in TRIGGER_TYPES:
+            trigger = {**trigger, "type": "recall"}
 
-    def _j(obj) -> str:
-        return json.dumps(obj, indent=2) if obj else "null"
+    def _j(o): return json.dumps(o, indent=2) if o else "null"
 
-    user = COMPOSE_USER_TEMPLATE.format(
+    user = COMPOSE_USER.format(
         merchant_json=_j(merchant),
         trigger_json=_j(trigger),
         customer_json=_j(customer),
         history_json=_j(reply_history),
     )
 
-    # Try LLM; fall back to rule-based if API key missing or call fails
     api_key = GEMINI_API_KEY if LLM_PROVIDER == "gemini" else OPENAI_API_KEY
     if not api_key:
-        logger.warning("No API key set — using rule-based fallback")
-        return _fallback_compose(merchant, trigger, customer)
+        logger.warning("No API key — using rule-based fallback")
+        return _fallback(merchant, trigger, customer)
 
     try:
-        raw    = _call_llm(system, user)
+        raw    = _call(SYSTEM_PROMPT, user)
         result = _extract_json(raw)
-
-        # Validate required fields
-        required = ["message", "cta", "send_as", "suppression_key", "rationale"]
-        for field in required:
-            if field not in result:
-                raise ValueError(f"Missing field: {field}")
-
+        for f in ["body", "cta", "send_as", "suppression_key", "rationale"]:
+            if f not in result:
+                raise ValueError(f"Missing: {f}")
         return result
-
     except Exception as e:
-        logger.error(f"LLM compose failed: {e} — using fallback")
-        return _fallback_compose(merchant, trigger, customer)
+        logger.error(f"LLM failed: {e} — using fallback")
+        return _fallback(merchant, trigger, customer)
