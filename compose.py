@@ -99,8 +99,9 @@ def compose(
     # ───────── TRIGGER LOGIC ─────────
 
     if trigger_type == "spike":
-        body = f"{views} people searched for {service} near you today. High demand — don't miss it."
-        cta = f"Start '{offer}' campaign now?"
+        body = f"{views} people searched for {service} near Sai Dental Clinic today — you're missing potential patients right now."
+
+        cta = f"Want me to send '{offer}' to them now?"
 
     elif trigger_type == "dip":
         body = f"Orders dropped to {orders} today. You may be losing customers."
