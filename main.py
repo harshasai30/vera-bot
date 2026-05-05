@@ -19,8 +19,8 @@ class TickPayload(BaseModel):
     tick_id: str
     merchant_id: str
     delivered_at: str
-    merchant: Optional[Dict[str, Any]] = None   
-    signals: Optional[Dict[str, Any]] = None    
+    merchant: Optional[Dict[str, Any]] = None   # ✅ FIX 2
+    signals: Optional[Dict[str, Any]] = None    # ✅ FIX 2
     trigger_id: Optional[str] = None
     customer_id: Optional[str] = None
 
